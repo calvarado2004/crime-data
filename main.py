@@ -1,13 +1,13 @@
 import threading
 import time
 
-from flask_api_app import FlaskAPICrimeApp
 from crime_data_fetcher import CrimeDataRetriever
+from flask_api_app import FlaskAPICrimeApp
 
 
 def send_to_rabbitmq():
     app_instance = FlaskAPICrimeApp()
-    app_instance.put_crime_data_rabbitmq()
+    app_instance.put_crime_data_rabbitmq('crime_data')
 
 
 if __name__ == "__main__":

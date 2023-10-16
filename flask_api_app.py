@@ -2,8 +2,13 @@ import os
 import json
 import pika
 import psycopg2
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+from prometheus_client import make_wsgi_app
+from werkzeug import run_simple
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+
+from metrics import REQUESTS_TOTAL, REQUESTS_IN_PROGRESS, REQUESTS_LATENCY, RABBITMQ_MESSAGES_SENT
 
 
 class FlaskAPICrimeApp:
@@ -24,16 +29,23 @@ class FlaskAPICrimeApp:
     def setup_routes(self):
         @self.app.route('/api/crime_data', methods=['GET'])
         def get_crime_data():
-            data = self.fetch_all_crime_data()
+            REQUESTS_TOTAL.inc()  # Increment by 1
+            with REQUESTS_IN_PROGRESS.track_inprogress():
+                data = self.fetch_all_crime_data()
             return jsonify(data)
+
+        self.app.wsgi_app = DispatcherMiddleware(self.app.wsgi_app, {
+            '/metrics': make_wsgi_app()
+        })
 
         @self.app.route('/api/crime_data/rabbitmq', methods=['GET'])
         def get_crime_data_rabbitmq():
-            data = self.put_crime_data_rabbitmq()
+            crime_queue = request.args.get('queue', 'crime_data')
+            data = self.put_crime_data_rabbitmq(crime_queue)
             return jsonify(data)
 
     def run(self):
-        self.app.run(debug=False, host='0.0.0.0', port=5050)
+        run_simple(hostname="0.0.0.0", port=5050, application=self.app.wsgi_app)
 
     def fetch_all_crime_data(self):
 
@@ -63,78 +75,82 @@ class FlaskAPICrimeApp:
             if conn:
                 conn.close()
 
-    def put_crime_data_rabbitmq(self):
+    def put_crime_data_rabbitmq(self, queue_name):
+        with REQUESTS_LATENCY.time():
 
-        conn = None
-        try:
-            # Connect to your postgres DB
-            conn = psycopg2.connect(
-                dbname=self.db_name,
-                user=self.db_username,
-                password=self.db_password,
-                host=self.db_host,
-                port=self.db_port
-            )
-            cur = conn.cursor()
+            conn = None
+            try:
+                # Connect to your postgres DB
+                conn = psycopg2.connect(
+                    dbname=self.db_name,
+                    user=self.db_username,
+                    password=self.db_password,
+                    host=self.db_host,
+                    port=self.db_port
+                )
+                cur = conn.cursor()
 
-            # Fetch the data from the crime_data table
-            cur.execute('SELECT object_id, crime_against, nibrs_code_name, offense_start_date, latitude, '
-                        'longitude, was_a_firearm_involved FROM crime_data WHERE crime_against = '
-                        '\'PERSON\';')
-            rows = cur.fetchall()
+                # Fetch the data from the crime_data table
+                cur.execute('SELECT object_id, crime_against, nibrs_code_name, offense_start_date, latitude, '
+                            'longitude, was_a_firearm_involved FROM crime_data WHERE crime_against = '
+                            '\'PERSON\';')
+                rows = cur.fetchall()
 
-            # Convert fetched data to the desired format
-            data = [{'crime_id': row[0], 'crime_against': row[1], 'crime_name': row[2], 'offense_start_date': row[3],
+                # Convert fetched data to the desired format
+                data = [
+                    {'crime_id': row[0], 'crime_against': row[1], 'crime_name': row[2], 'offense_start_date': row[3],
                      'latitude': row[4], 'longitude': row[5], 'firearm_involved': row[6]} for row in rows]
 
-            # Connect to RabbitMQ
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=self.rabbitmq_host, port=self.rabbitmq_port,
-                                          credentials=pika.PlainCredentials(username=self.rabbitmq_username,
-                                                                            password=self.rabbitmq_password)))
-            channel = connection.channel()
+                # Connect to RabbitMQ
+                connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(host=self.rabbitmq_host, port=self.rabbitmq_port,
+                                              credentials=pika.PlainCredentials(username=self.rabbitmq_username,
+                                                                                password=self.rabbitmq_password)))
+                channel = connection.channel()
 
-            channel.queue_declare(queue='crime_data')
+                channel.queue_declare(queue=queue_name)
 
-            # Iterate over each item in the data list and send it as a separate message
-            for item in data:
-                # Check if the item is in the sent_messages table
-                cur.execute(
-                    'SELECT 1 FROM sent_messages WHERE crime_id = %s;',
-                    (item['crime_id'],)
-                )
-                if cur.fetchone():
-                    print(f"Already sent message for crime_id {item['crime_id']}, skipping...")
-                    continue  # Skip to the next item
+                # Iterate over each item in the data list and send it as a separate message
+                for item in data:
+                    # Check if the item is in the sent_messages table
+                    cur.execute(
+                        'SELECT 1 FROM sent_messages WHERE crime_id = %s;',
+                        (item['crime_id'],)
+                    )
+                    if cur.fetchone():
+                        print(f"Already sent message for crime_id {item['crime_id']}, skipping...")
+                        continue  # Skip to the next item
 
-                # Send the item to RabbitMQ
-                item_json = json.dumps(item)
-                item_bytes = bytes(item_json, 'utf-8')
-                channel.basic_publish(exchange='', routing_key='crime_data', body=item_bytes)
-                print(f"Sent data to RabbitMQ: {item}")
+                    # Send the item to RabbitMQ
+                    item_json = json.dumps(item)
+                    item_bytes = bytes(item_json, 'utf-8')
+                    channel.basic_publish(exchange='', routing_key='crime_data', body=item_bytes)
+                    print(f"Sent data to RabbitMQ: {item}")
 
-                # Insert already sent message into the sent_messages table
-                cur.execute(
-                    '''
-                    INSERT INTO sent_messages (
-                        crime_against, crime_name, crime_id, 
-                        latitude, longitude, offense_start_date, firearm_involved
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s);
-                    ''',
-                    (item['crime_against'], item['crime_name'], item['crime_id'],
-                     item['latitude'], item['longitude'], item['offense_start_date'], item['firearm_involved'])
-                )
+                    # Insert already sent message into the sent_messages table
+                    cur.execute(
+                        '''
+                        INSERT INTO sent_messages (
+                            crime_against, crime_name, crime_id, 
+                            latitude, longitude, offense_start_date, firearm_involved
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s);
+                        ''',
+                        (item['crime_against'], item['crime_name'], item['crime_id'],
+                         item['latitude'], item['longitude'], item['offense_start_date'], item['firearm_involved'])
+                    )
 
-            # Commit the changes to the database
-            conn.commit()
+                # Commit the changes to the database
+                conn.commit()
 
-            connection.close()
-        except Exception as e:
-            print(f"Error: {e}")
-            return []
+                connection.close()
+            except Exception as e:
+                print(f"Error: {e}")
+                return []
 
-        finally:
-            if conn:
-                conn.close()
+            finally:
+                if conn:
+                    conn.close()
 
-        return data
+            RABBITMQ_MESSAGES_SENT.inc()
+
+            return data
